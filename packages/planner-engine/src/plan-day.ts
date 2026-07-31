@@ -9,7 +9,8 @@ export function planDay(input: PlannerDayInput): PlanDayResult {
     throw new RangeError("Invalid day range or start location");
   }
 
-  const travel = input.travelMinutes ?? estimateWalkingMinutes;
+  const travel: NonNullable<PlannerDayInput["travelMinutes"]> =
+    input.travelMinutes ?? ((from, to) => estimateWalkingMinutes(from, to));
   const remaining = input.candidates.filter((item) => item.durationMinutes > 0 && isValidPoint(item.location));
   const invalid = input.candidates.filter((item) => item.durationMinutes <= 0 || !isValidPoint(item.location));
   const stops: PlannedStop[] = [];
@@ -21,11 +22,15 @@ export function planDay(input: PlannerDayInput): PlanDayResult {
 
   while (remaining.length && stops.length < maxStops) {
     const choices = remaining.map((candidate) => {
-      const travelMinutes = Math.ceil(travel(location, candidate.location));
+      const rawTravelMinutes = travel(location, candidate.location);
+      const travelMinutes = Number.isFinite(rawTravelMinutes) && rawTravelMinutes >= 0
+        ? Math.ceil(rawTravelMinutes)
+        : Number.POSITIVE_INFINITY;
       const arrivalMinute = minute + travelMinutes;
       const startMinute = getStart(candidate, arrivalMinute);
       const endMinute = startMinute === null ? Number.POSITIVE_INFINITY : startMinute + candidate.durationMinutes;
-      const score = weights[candidate.priority] + travelMinutes + (candidate.preferredOrder ?? 0) * 3;
+      const lockedBonus = candidate.locked ? -5000 : 0;
+      const score = weights[candidate.priority] + lockedBonus + travelMinutes + (candidate.preferredOrder ?? 0) * 3;
       return { candidate, travelMinutes, arrivalMinute, startMinute, endMinute, score };
     }).filter((item) => item.startMinute !== null && item.endMinute <= input.dayEndMinute)
       .sort((a, b) => a.score - b.score || a.endMinute - b.endMinute);
@@ -33,6 +38,12 @@ export function planDay(input: PlannerDayInput): PlanDayResult {
     const next = choices[0];
     if (!next || next.startMinute === null) break;
     const waitMinutes = next.startMinute - next.arrivalMinute;
+    const explanation = [
+      next.candidate.priority === "required" ? "必去地点优先" : "综合距离与偏好排序",
+      `预计通勤 ${next.travelMinutes} 分钟`,
+    ];
+    if (next.candidate.locked) explanation.unshift("保留用户锁定地点");
+
     stops.push({
       placeId: next.candidate.placeId,
       sequence: stops.length + 1,
@@ -41,10 +52,7 @@ export function planDay(input: PlannerDayInput): PlanDayResult {
       endMinute: next.endMinute,
       travelMinutesFromPrevious: next.travelMinutes,
       waitMinutes,
-      explanation: [
-        next.candidate.priority === "required" ? "必去地点优先" : "综合距离与偏好排序",
-        `预计通勤 ${next.travelMinutes} 分钟`,
-      ],
+      explanation,
     });
     minute = next.endMinute;
     location = next.candidate.location;
@@ -78,7 +86,15 @@ export function planDay(input: PlannerDayInput): PlanDayResult {
 
 function getStart(candidate: PlannerCandidate, arrival: number): number | null {
   if (candidate.fixedStartMinute !== undefined) {
-    return arrival <= candidate.fixedStartMinute ? candidate.fixedStartMinute : null;
+    if (arrival > candidate.fixedStartMinute) return null;
+    if (!candidate.openingWindows?.length) return candidate.fixedStartMinute;
+    const fixedEnd = candidate.fixedStartMinute + candidate.durationMinutes;
+    const fits = candidate.openingWindows.some((window) =>
+      candidate.fixedStartMinute! >= window.opensAtMinute &&
+      fixedEnd <= window.closesAtMinute &&
+      (window.lastEntryAtMinute === undefined || candidate.fixedStartMinute! <= window.lastEntryAtMinute),
+    );
+    return fits ? candidate.fixedStartMinute : null;
   }
   if (!candidate.openingWindows?.length) return arrival;
   for (const window of candidate.openingWindows) {
